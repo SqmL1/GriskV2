@@ -1,5 +1,9 @@
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 
+
 raw/
+logs/

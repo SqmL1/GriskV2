@@ -242,3 +242,103 @@ def collect_post_and_comments(conn: sqlite3.Connection, submission) -> None:
             store_comment(conn, c, post_id=submission.id)
     except prawcore.exceptions.RequestException as e:
         LOGGER.warning("Comment fetch failed for %s: %s", submission.id, e)
+
+def run_once(
+    conn: sqlite3.Connection,
+    reddit: praw.Reddit,
+    subreddit: str,
+    max_posts: int,
+    since_hours: Optional[int],
+) -> None:
+    since_ts = None
+    if since_hours is not None and since_hours > 0:
+        since_ts = int((datetime.now(timezone.utc) - timedelta(hours=since_hours)).timestamp())
+    else:
+        # Default to last seen post in DB, if any
+        since_ts = get_last_post_ts(conn)
+
+    LOGGER.info(
+        "Starting collection for r/%s | max_posts=%s | since_ts=%s",
+        subreddit,
+        max_posts,
+        since_ts,
+    )
+    new_count = 0
+    err_count = 0
+    for s in iter_new_submissions(reddit, subreddit, max_posts=max_posts, since_ts=since_ts):
+        try:
+            collect_post_and_comments(conn, s)
+            new_count += 1
+            # Commit in small batches to keep WAL size in check
+            if new_count % 10 == 0:
+                conn.commit()
+        except (prawcore.exceptions.Forbidden, prawcore.exceptions.NotFound) as e:
+            LOGGER.warning("Skipping submission %s due to access issue: %s", s.id, e)
+        except prawcore.exceptions.TooManyRequests as e:
+            # Respect rate limits
+            wait = getattr(e, "sleep_time", 10)
+            LOGGER.warning("Rate limited. Sleeping %.1fs", wait)
+            time.sleep(wait)
+        except Exception as e:  # noqa: BLE001
+            err_count += 1
+            LOGGER.exception("Error processing submission %s: %s", getattr(s, "id", "?"), e)
+
+    conn.commit()
+    LOGGER.info("Done. New/updated submissions processed: %d | errors: %d", new_count, err_count)
+
+def main():
+    parser = argparse.ArgumentParser(description="WSB PRAW ingestor → SQLite")
+    parser.add_argument("--db", required=True, help="Path to SQLite DB file, e.g., data/wsb.db")
+    parser.add_argument("--subreddit", default="wallstreetbets", help="Subreddit to ingest")
+    parser.add_argument("--max-posts", type=int, default=300, help="Max posts to scan per run")
+    parser.add_argument("--since-hours", type=int, default=None, help="Lookback hours (overrides DB last-seen)")
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=0,
+        help="If >0, poll repeatedly at this interval; otherwise run once",
+    )
+
+    args = parser.parse_args()
+
+    conn = init_db(args.db)
+
+    try:
+        reddit = praw_client()
+    except Exception as e:  # noqa: BLE001
+        LOGGER.error("Failed to init PRAW client: %s", e)
+        sys.exit(2)
+
+    # Looping mode (simple daemon)
+    if args.interval_seconds and args.interval_seconds > 0:
+        LOGGER.info("Entering loop mode: every %ss", args.interval_seconds)
+        while True:
+            try:
+                run_once(
+                    conn=conn,
+                    reddit=reddit,
+                    subreddit=args.subreddit,
+                    max_posts=args.max_posts,
+                    since_hours=args.since_hours,
+                )
+            except prawcore.exceptions.ResponseException as e:
+                LOGGER.warning("API response exception: %s", e)
+            except Exception as e:  # noqa: BLE001
+                LOGGER.exception("Unhandled error in loop: %s", e)
+            finally:
+                # light backoff between cycles
+                time.sleep(args.interval_seconds)
+    else:
+        run_once(
+            conn=conn,
+            reddit=reddit,
+            subreddit=args.subreddit,
+            max_posts=args.max_posts,
+            since_hours=args.since_hours,
+        )
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
